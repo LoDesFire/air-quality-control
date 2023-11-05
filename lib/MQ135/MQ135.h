@@ -2,7 +2,7 @@
 
 class MQ135 : public MQ
 {
-  float HaTFunction(int, float);
+  float HaTFunction(float, int);
 
 public:
   MQ135(int port);

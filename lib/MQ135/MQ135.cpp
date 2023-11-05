@@ -19,7 +19,7 @@ MQ135::MQ135(int port) : MQ(port, 75.f, 75.f)
 {
 }
 
-float MQ135::HaTFunction(int rh, float t)
+float MQ135::HaTFunction(float t, int rh)
 {
   if (rh != 33 & rh != 85)
     return 0;
