@@ -6,8 +6,7 @@
 
 #include <cstring>
 
-#include <MQ4.h>
-#include <MQ135.h>
+#include <MQUnifiedsensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
 #include <Adafruit_Sensor.h>
@@ -21,29 +20,26 @@
 #define PERIOD_SEC 5
 #define ISSUE_TIMER_SEC 600
 
-void wifiDisconnetcedHandler(arduino_event_t *event);
-
-static void recordings_timer_callback(void *args);
+static void recordingsTimerCallback(void *args);
 
 esp_timer_handle_t _timer = NULL;
 
 esp_timer_create_args_t timerConfig = {
-    .callback = recordings_timer_callback,
+    .callback = recordingsTimerCallback,
     .arg = NULL,
     .dispatch_method = ESP_TIMER_TASK,
     .name = "get_recordings_timer",
-    .skip_unhandled_events = false};
-
+    .skip_unhandled_events = true};
 
 esp_timer_handle_t restart_timer = NULL;
 
 esp_timer_create_args_t restartTimerConfig = {
-    .callback = [](void *) {ESP.restart();},
+    .callback = [](void *)
+    { ESP.restart(); },
     .arg = NULL,
     .dispatch_method = ESP_TIMER_TASK,
     .name = "restart_timer",
     .skip_unhandled_events = false};
-
 
 // const char *ssid = "define (;;) ever \\n forever";
 // const char *password = "bsuir_the_best";
@@ -59,13 +55,28 @@ const char *password = "";
 
 bool LED_VALUE;
 
+enum EspState
+{
+  NONE = 0,
+  HIGH_CO2 = 1,
+  HIGH_CH4 = 2,
+  SENSORS_ISSUE = 4,
+};
+
+int espState = EspState::NONE;
+TaskHandle_t pushQueryTaskHandle;
+TaskHandle_t pushExtraQueryTaskHandle;
+
 class ServerApi
 {
-  String apiUrl = "https://airqualityapi-georga399.amvera.io/api/";
+  String apiUrl;
+  DynamicJsonDocument *records;
+  StaticJsonDocument<20> **statusCodes;
   HTTPClient *httpClient;
-  DynamicJsonDocument *jsonDocument;
+  const int STATUS_CODES_LENGTH = 10;
+  int statusCodesPointer;
 
-  int POST(String endpoint, DynamicJsonDocument *document)
+  int POST(String endpoint, JsonDocument *document)
   {
     String payload;
     httpClient = new HTTPClient();
@@ -76,11 +87,6 @@ class ServerApi
     int code = httpClient->POST(payload);
     delete httpClient;
 
-    if (code == 200)
-    {
-      delete jsonDocument;
-      jsonDocument = new DynamicJsonDocument(40000);
-    }
     ESP_LOGI("api", "POST query. Response code: %d", code);
     return code;
   }
@@ -88,68 +94,130 @@ class ServerApi
 public:
   ServerApi()
   {
-    jsonDocument = new DynamicJsonDocument(40000);
+    apiUrl = "https://airqualityapi-georga399.amvera.io/api/";
+    records = new DynamicJsonDocument(40000);
+    statusCodes = new StaticJsonDocument<20> *[STATUS_CODES_LENGTH]
+    { nullptr };
+    statusCodesPointer = -1;
   }
 
-  bool push(uint32_t timestamp, float *record)
+  void push(uint32_t timestamp, float *raw)
   {
-    JsonObject jObj = jsonDocument->createNestedObject();
+    JsonObject record = records->createNestedObject();
 
-    jObj["date"] = timestamp;
-    jObj["temperatureC"] = record[0];
-    jObj["humidity"] = record[1];
-    jObj["cH4"] = record[2];
-    jObj["cO2"] = record[3];
+    record["date"] = timestamp;
+    record["temperatureC"] = raw[0];
+    record["humidity"] = raw[1];
+    record["cH4"] = raw[2];
+    record["cO2"] = raw[3];
 
-    ESP_LOGI("api", "Pushed new record. Size: %d", jsonDocument->size());
-    if (jsonDocument->size() > 19 && POST("rawdata/push", jsonDocument) == 200)
-      jsonDocument->clear();
-
-    if (jsonDocument->size() > 50)
-      return false;
-
-    return true;
+    ESP_LOGI("api", "Pushed new record. Size: %d", records->size());
   }
 
-  void pushExtra(uint32_t *timestamp, float *record)
+  void pushExtra(int *extraCode)
   {
+    auto extraData = new StaticJsonDocument<20>;
+    // int *code = static_cast<int *>(extraCode);
+    (*extraData)["statusCode"] = *extraCode;
+    delete extraCode;
+    if (statusCodesPointer < STATUS_CODES_LENGTH - 1)
+      statusCodes[++statusCodesPointer] = extraData;
+    // makeQueryTask();
+  }
+
+  void pushQuery(void *)
+  {
+    // DynamicJsonDocument *records = static_cast<DynamicJsonDocument *>(jsonDocument);
+    int responseCode = 0;
+    ESP_LOGI("tasks", "%d", esp_get_free_heap_size());
+    int responseCode = POST("rawdata/push", records);
+    if (responseCode == 200 || responseCode == -11)
+    {
+      delete records;
+      records = new DynamicJsonDocument(40000);
+    }
+  }
+
+  void pushExtraQuery(void *)
+  {
+    // StaticJsonDocument<20> *statusCode = static_cast<StaticJsonDocument<20> *>(jsonDocument);
+    int responseCode = POST("rawdata/pushExtra", statusCodes[statusCodesPointer]);
+
+    if (responseCode == 200 || responseCode == -11)
+    {
+      delete statusCodes[statusCodesPointer];
+      statusCodesPointer--;
+    }
+  }
+
+  bool isExtraEmpty()
+  {
+    return statusCodesPointer != -1;
+  }
+
+  int recordsSize()
+  {
+    return records->size();
   }
 };
 
 class Sensors
 {
-  MQ4 mq4;
-  MQ135 mq135;
+  MQUnifiedsensor mq4;
+  MQUnifiedsensor mq135;
   DHT_Unified dht;
   OneWire oneWire;
   DallasTemperature tSensor;
 
 public:
   Sensors(u8_t mq4_pin, u8_t mq135_pin, u8_t dht_pin, u8_t dallasTemperature_pin)
-      : mq4(mq4_pin), mq135(mq135_pin), dht(dht_pin, DHT11), oneWire(dallasTemperature_pin), tSensor(&oneWire)
+      : mq4("ESP-32", 3.3f, 12, mq4_pin, "MQ-4"),
+        mq135("ESP-32", 3.3f, 12, mq135_pin, "MQ-135"),
+        dht(dht_pin, DHT11),
+        oneWire(dallasTemperature_pin),
+        tSensor(&oneWire)
   {
+    mq4.setRegressionMethod(1);
+    mq4.setA(1012.7);
+    mq4.setB(-2.786);
+    mq4.setRL(43.0f);
+    mq4.setR0(380.0f);
+    mq135.setRegressionMethod(1);
+    mq135.setA(102.2);
+    mq135.setB(-2.473);
+    mq135.setRL(75.0f);
+    mq135.setR0(2100);
   }
 
   void begin()
   {
+    mq4.init();
+    mq135.init();
     dht.begin();
-    mq4.begin();
-    mq135.begin();
     tSensor.begin();
   }
 
   float *get_records()
   {
-    float *records = new float[4];
     sensors_event_t event;
+    mq4.update();
+    mq135.update();
     dht.humidity().getEvent(&event);
     tSensor.requestTemperatures();
-    if (isnan(event.relative_humidity))
+    float temp = tSensor.getTempCByIndex(0);
+    float humidity = event.relative_humidity;
+    float cFactor_mq4 = -((0.83f / 100.0f * temp * temp - 0.92 * temp + 25 - (0.3 * humidity)) / 100.0f);
+    float cFactor_mq135 = 0.00035f * temp * temp - 0.02718f * temp + 1.39538f - (humidity - 33.f) * 0.0018f;
+    float mq4_value = mq4.readSensor(false, cFactor_mq4);
+    float mq135_value = mq135.readSensor(false, cFactor_mq135);
+
+    if (isnanf(humidity) || isinff(mq4_value) || isnan(mq4_value) || isinff(mq135_value) || isnan(mq135_value))
       return nullptr;
-    records[0] = tSensor.getTempCByIndex(0);
-    records[1] = event.relative_humidity;
-    records[2] = mq4.getValue(records[0], records[1]);
-    records[3] = mq135.getValue(records[0], records[1]);
+    float *records = new float[4]{
+        temp,
+        humidity,
+        mq4_value,
+        mq135_value};
     return records;
   }
 };
@@ -157,50 +225,125 @@ public:
 ServerApi api;
 Sensors sensors(MQ4_PIN, MQ135_PIN, DHT_PIN, ONE_WIRE_PIN);
 
-static void recordings_timer_callback(void *args)
+void pushExtraQuery(void *)
+{
+  api.pushExtraQuery(nullptr);
+  vTaskDelete(NULL);
+}
+
+void pushQuery(void *)
+{
+  api.pushQuery(nullptr);
+  vTaskDelete(NULL);
+}
+
+void pushExtra(void *code)
+{
+  int *extraCode = static_cast<int *>(code);
+  api.pushExtra(extraCode);
+  vTaskDelete(NULL);
+}
+
+void makeQueryTask()
+{
+  if (api.isExtraEmpty())
+  {
+    xTaskCreate(
+        pushExtraQuery,
+        "pushExtraQuery",
+        20480,
+        // static_cast<void *>(statusCodes[statusCodesPointer]),
+        nullptr,
+        4 | portPRIVILEGE_BIT,
+        &pushExtraQueryTaskHandle);
+  }
+  if (api.recordsSize() > 0)
+    xTaskCreate(
+        pushQuery,
+        "pushQuery",
+        20480,
+        nullptr,
+        1 | portPRIVILEGE_BIT,
+        &pushQueryTaskHandle);
+}
+
+static void recordingsTimerCallback(void *args)
 {
   ESP_LOGI("timer", "Callback");
   tm loctime;
   getLocalTime(&loctime);
   float *records = sensors.get_records();
 
-  if (loctime.tm_year == 70 || records == nullptr)
+  if (records == nullptr)
   {
-    ESP_LOGI("recordings", "Timestamp: %u, rh: %f", mktime(&loctime));
-    return;
+    ESP_LOGI("recordings", "Timestamp: %u", mktime(&loctime));
+    if (espState != EspState::SENSORS_ISSUE)
+    {
+      int *code = new int(EspState::SENSORS_ISSUE);
+      api.pushExtra(code);
+    }
   }
   else
   {
+    if (espState == EspState::SENSORS_ISSUE)
+      espState = EspState::NONE;
     ESP_LOGI("recordings", "Timestamp: %u, values: [%f, %f, %f, %f]", mktime(&loctime), records[0], records[1], records[2], records[3]);
   }
 
-  if (!api.push(mktime(&loctime), records))
-  {
-    esp_timer_stop(_timer);
-    ESP_LOGW("timer", "Timer stopped due to Internet problems");
-  }
-  delete[] records;
+  api.push(mktime(&loctime), records);
+
+  makeQueryTask();
 }
 
-void wifiDisconnetcedHandler(arduino_event_t *event)
+static IRAM_ATTR void highCH4Callback(void *args)
 {
-  if (!esp_timer_is_active(restart_timer)) {
+  TaskHandle_t null;
+  int *code = new int(EspState::HIGH_CH4);
+  xTaskCreate(
+      pushExtra,
+      "highCH4",
+      3000,
+      static_cast<void *>(code),
+      4 | portPRIVILEGE_BIT,
+      &null);
+}
+
+static IRAM_ATTR void highCO2Callback(void *args)
+{
+  TaskHandle_t null;
+  int *code = new int(EspState::HIGH_CO2);
+  xTaskCreate(
+      pushExtra,
+      "highCO2",
+      3000,
+      static_cast<void *>(code),
+      4 | portPRIVILEGE_BIT,
+      &null);
+}
+
+void wifiDisconnetcedCallback(arduino_event_t *event)
+{
+  if (!esp_timer_is_active(restart_timer))
+  {
     ESP_LOGI("restart_timer", "Started");
     esp_timer_start_once(restart_timer, ISSUE_TIMER_SEC * 1000000);
   }
   WiFi.begin(ssid, password);
   digitalWrite(LED_BUILTIN, LED_VALUE = !LED_VALUE);
-  delay(500);
+  delay(1000);
 }
 
-void initializeTime() {
+void initializeTime()
+{
   configTime(3 * 3600, 0, "europe.pool.ntp.org");
   tm inTime;
-  while (inTime.tm_year < 71) 
+  do
+  {
     getLocalTime(&inTime);
+  } while (inTime.tm_year < 71);
 }
 
-void wifiConnetcedHandler(arduino_event_t *event)
+void wifiConnetcedCallback(arduino_event_t *event)
 {
   if (!esp_timer_is_active(_timer))
   {
@@ -216,7 +359,6 @@ void wifiConnetcedHandler(arduino_event_t *event)
 
 void setup()
 {
-  WiFi.begin(ssid, password);
   Serial.begin(9600);
   sensors.begin();
   pinMode(LED_BUILTIN, OUTPUT);
@@ -233,11 +375,13 @@ void setup()
   ESP_LOGI("timer", "Succsessfully created");
 
   ESP_LOGI("wifi", "WiFi connecting...");
-  WiFi.onEvent(wifiConnetcedHandler, ARDUINO_EVENT_WIFI_STA_CONNECTED);
-  WiFi.onEvent(wifiDisconnetcedHandler, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-  WiFi.onEvent(wifiDisconnetcedHandler, ARDUINO_EVENT_WIFI_STA_LOST_IP);
+  WiFi.onEvent(wifiConnetcedCallback, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(wifiDisconnetcedCallback, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  WiFi.onEvent(wifiDisconnetcedCallback, ARDUINO_EVENT_WIFI_STA_LOST_IP);
 
-  wifiDisconnetcedHandler(nullptr);
+  wifiDisconnetcedCallback(nullptr);
 }
 
-void loop() {}
+void loop()
+{
+}
